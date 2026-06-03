@@ -160,7 +160,7 @@ This also promotes the LDAP group to a first-class, managed entity: the `rhnUser
 
 ## RBAC integration
 
-The new RBAC model (`access.namespace`, `access.endpoint`, `access.accessGroup`) is used only to protect the new LDAP configuration endpoints: the setup pages and API methods are registered in the RBAC endpoint mapping so only privileged administrators can read or change LDAP configuration. LDAP-derived user roles continue to flow through `rhnUserGroup`. Automatic population of `access.accessGroup` from LDAP groups is out of scope for v1.
+The new RBAC model (`access.namespace`, `access.endpoint`, `access.accessGroup`) is used only to protect the new LDAP configuration endpoints: the setup pages and API methods are registered in the RBAC endpoint mapping[^3] so only privileged administrators can read or change LDAP configuration. LDAP-derived user roles continue to flow through `rhnUserGroup`. Automatic population of `access.accessGroup` from LDAP groups is out of scope for v1.
 
 ## Database design
 
@@ -174,49 +174,19 @@ Reused tables:
 | `rhnUserExtGroup` / `rhnUserExtGroupMapping` | external group to role mapping (revived) |
 | `suseCredentials` | bind password, via a new `ldap` credential type (see below) |
 
-One new table holds the connection configuration (one row per directory; `server_type` and `transport` are Java enums, as CoCo attestation models `env_type`):
+One new entity (working name `suseLdapAuthServer`, one row per configured directory) holds the connection and mapping configuration. Rather than fix the exact columns, types, and constraints now, the design captures the data the entity must hold, grouped by purpose; the concrete schema is settled during implementation:
 
-```sql
-CREATE TABLE suseLdapAuthServer (
-    id              NUMERIC NOT NULL CONSTRAINT suse_ldapauth_id_pk PRIMARY KEY,
-    label           VARCHAR(128) NOT NULL,
-    enabled         CHAR(1) NOT NULL DEFAULT 'Y',
-    server_type     VARCHAR(32)  NOT NULL,          -- ACTIVE_DIRECTORY | FREE_IPA | OPENLDAP | POSIX
-    host            VARCHAR(256) NOT NULL,
-    port            NUMERIC      NOT NULL DEFAULT 636,
-    transport       VARCHAR(16)  NOT NULL DEFAULT 'LDAPS',  -- LDAPS | STARTTLS | PLAIN
-    bind_dn         VARCHAR(512),                   -- null => anonymous bind
-    credentials_id  NUMERIC NULL CONSTRAINT suse_ldapauth_cred_fk REFERENCES suseCredentials (id),
-    user_base_dn    VARCHAR(512) NOT NULL,
-    user_filter     VARCHAR(512) NOT NULL,
-    login_attr      VARCHAR(64)  NOT NULL,
-    firstname_attr  VARCHAR(64),
-    lastname_attr   VARCHAR(64),
-    email_attr      VARCHAR(64),
-    group_base_dn   VARCHAR(512),
-    group_filter    VARCHAR(512),
-    group_name_attr VARCHAR(64)  DEFAULT 'cn',
-    use_member_of   CHAR(1)      NOT NULL DEFAULT 'N',
-    auth_filter     VARCHAR(512),                   -- optional pre-auth scope filter
-    provisioning    VARCHAR(16)  NOT NULL DEFAULT 'JIT',
-    default_org_id  NUMERIC CONSTRAINT suse_ldapauth_org_fk REFERENCES web_customer (id),
-    connect_timeout NUMERIC      NOT NULL DEFAULT 5000,   -- ms
-    created         TIMESTAMPTZ  DEFAULT (current_timestamp) NOT NULL,
-    modified        TIMESTAMPTZ  DEFAULT (current_timestamp) NOT NULL
-);
-CREATE SEQUENCE suse_ldapauth_id_seq;
-CREATE UNIQUE INDEX suse_ldapauth_label_uq ON suseLdapAuthServer (label);
-```
+- **Connection** - label, enabled flag, server type, host, port, transport, and a connect/response timeout. Server type (`ACTIVE_DIRECTORY` / `FREE_IPA` / `OPENLDAP` / `POSIX`) and transport (`LDAPS` / `STARTTLS` / `PLAIN`) are modeled as Java enums, as CoCo attestation models `env_type`[^6].
+- **Bind account** - the service-account bind DN (null meaning anonymous bind) and a reference to the stored bind password (see below).
+- **User lookup** - user base DN, user search filter, login attribute, and optional first-name, last-name, and email attributes.
+- **Group lookup** - group base DN, group filter, group-name attribute (default `cn`), a `memberOf` toggle, and an optional pre-authentication scope filter.
+- **Provisioning** - provisioning mode (`JIT` / `EXISTING_ONLY`) and the default org applied to JIT-created users.
 
-To make external groups first-class and LDAP-scoped, a nullable FK is added to the existing table. A null value preserves today's server-agnostic behavior (used by `REMOTE_USER`); a set value scopes the mapping to one directory:
+This entity is the single source of truth for a directory, and the enum-backed fields keep server-type and transport handling type-safe in Java rather than relying on free-form strings.
 
-```sql
-ALTER TABLE rhnUserExtGroup
-    ADD COLUMN ldap_server_id NUMERIC NULL
-        CONSTRAINT rhn_uextgrp_ldapsrv_fk REFERENCES suseLdapAuthServer (id);
-```
+To make external groups first-class and optionally LDAP-scoped, the design adds a nullable reference from `rhnUserExtGroup` to the new directory entity. A null value preserves today's server-agnostic behavior (used by `REMOTE_USER`); a set value scopes the mapping to one directory. Modeling this as a nullable link on the existing table, rather than a parallel new table, avoids duplicating the established external-group mechanism.
 
-The **bind password** is stored in `suseCredentials` under a new `ldap` type, reusing the `PasswordBasedCredentials` subclass pattern already used for SCC, registry, and cloud-RMT credentials (Base64-encoded at rest in the `password` column). This means adding `ldap` to the `suseCredentials.type` check constraint and the `CredentialsType` enum, plus an `LdapCredentials` entity. The password is write-only in the UI/API, as SCC credentials are. Whether Base64-at-rest is sufficient or stronger encryption is required is left open below.
+The **bind password** is stored in `suseCredentials` under a new `ldap` credential type, reusing the `PasswordBasedCredentials` pattern already used for SCC, registry, and cloud-RMT credentials (Base64-encoded at rest). In practice this adds an `ldap` type to the credential model and a corresponding credentials entity; the password is write-only in the UI/API, as SCC credentials are. Whether Base64-at-rest is sufficient or stronger encryption is required is left open below.
 
 ## Transport security
 
